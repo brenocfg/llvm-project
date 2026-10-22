@@ -33,10 +33,11 @@ class SampleProfileMatcher {
   const PseudoProbeManager *ProbeManager;
   const ThinOrFullLTOPhase LTOPhase;
   SampleProfileMap FlattenedProfiles;
-  // For each function, the matcher generates a map, of which each entry is a
-  // mapping from the source location of current build to the source location
-  // in the profile.
+  // Each profile gets a map from current-build locations to profile locations.
+  // If multiple IR functions use a profile, retain only an identical mapping
+  // for all of them, since FunctionSamples cannot select a map per IR function.
   StringMap<LocToLocMap> FuncMappings;
+  StringSet<> ProfilesWithConflictingMappings;
   // Hash mapping cache for matched anchor pairs in stale profile matching
   DenseMap<FunctionId, const Function *> MatchedAnchorCache;
 
@@ -129,6 +130,7 @@ public:
     // by FuncNameToProfNameMap. Clearing this memory could lead to a
     // use-after-free error.
     freeContainer(FuncCallsiteMatchStates);
+    freeContainer(ProfilesWithConflictingMappings);
     freeContainer(FunctionsWithoutProfile);
     freeContainer(FuncToProfileNameMap);
   }
@@ -144,6 +146,7 @@ private:
     StringRef CanonFName = FunctionSamples::getCanonicalFnName(F);
     return getFlattenedSamplesFor(FunctionId(CanonFName));
   }
+  const FunctionSamples *getSamplesForMatching(Function &F);
   template <typename T> inline void freeContainer(T &C) {
     T Empty;
     std::swap(C, Empty);
@@ -158,9 +161,11 @@ private:
                           AnchorMap &ProfileAnchors) const;
   bool anchorsMatch(const FunctionId &IRAnchor,
                     const FunctionId &ProfileAnchor) const;
+  void collectCallsiteMatchStates(bool IsPostMatch);
   // Record the callsite match states for profile staleness report, the result
   // is saved in FuncCallsiteMatchStates.
-  void recordCallsiteMatchStates(const Function &F, const AnchorMap &IRAnchors,
+  void recordCallsiteMatchStates(StringRef ProfileName,
+                                 const AnchorMap &IRAnchors,
                                  const AnchorMap &ProfileAnchors,
                                  const LocToLocMap *IRToProfileLocationMap);
 
@@ -196,9 +201,6 @@ private:
   void computeAndReportProfileStaleness();
   void UpdateWithSalvagedProfiles();
 
-  LocToLocMap &getIRToProfileLocationMap(const FunctionSamples &FS) {
-    return FuncMappings[FS.getFuncName()];
-  }
   void distributeIRToProfileLocationMap();
   void distributeIRToProfileLocationMap(FunctionSamples &FS);
   LocToLocMap longestCommonSequence(const AnchorList &IRCallsiteAnchors,

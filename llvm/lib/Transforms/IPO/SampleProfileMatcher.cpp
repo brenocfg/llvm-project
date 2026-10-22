@@ -463,13 +463,8 @@ void SampleProfileMatcher::runStaleProfileMatching(
     matchNonCallsiteLocs(MatchedAnchors, IRAnchors, IRToProfileLocationMap);
 }
 
-void SampleProfileMatcher::runOnFunction(Function &F) {
-  // We need to use flattened function samples for matching.
-  // Unlike IR, which includes all callsites from the source code, the callsites
-  // in profile only show up when they are hit by samples, i,e. the profile
-  // callsites in one context may differ from those in another context. To get
-  // the maximum number of callsites, we merge the function profiles from all
-  // contexts, aka, the flattened profile to find profile anchors.
+const FunctionSamples *
+SampleProfileMatcher::getSamplesForMatching(Function &F) {
   const auto *FSForMatching = getFlattenedSamplesFor(F);
   if (SalvageUnusedProfile && !FSForMatching) {
     // Apply the matching in place to find the new function's matched profile.
@@ -483,8 +478,19 @@ void SampleProfileMatcher::runOnFunction(Function &F) {
         FSForMatching = Reader.getSamplesFor(R->second.stringRef());
     }
   }
+  return FSForMatching;
+}
+
+void SampleProfileMatcher::runOnFunction(Function &F) {
+  if (!SalvageStaleProfile)
+    return;
+
+  // Unlike IR, a profile contains only callsites hit by samples. Use the
+  // flattened profile to include anchors from all contexts.
+  const auto *FSForMatching = getSamplesForMatching(F);
   if (!FSForMatching)
     return;
+  StringRef ProfileName = FSForMatching->getFuncName();
 
   // Anchors for IR. It's a map from IR location to callee name, callee name is
   // empty for non-call instruction and use a dummy name(UnknownIndirectCallee)
@@ -496,12 +502,6 @@ void SampleProfileMatcher::runOnFunction(Function &F) {
   AnchorMap ProfileAnchors;
   findProfileAnchors(*FSForMatching, ProfileAnchors);
 
-  // Compute the callsite match states for profile staleness report.
-  if (ReportProfileStaleness || PersistProfileStaleness)
-    recordCallsiteMatchStates(F, IRAnchors, ProfileAnchors, nullptr);
-
-  if (!SalvageStaleProfile)
-    return;
   // For probe-based profiles, run matching only when profile checksum is
   // mismatched.
   bool ChecksumMismatch = FunctionSamples::ProfileIsProbeBased &&
@@ -516,24 +516,56 @@ void SampleProfileMatcher::runOnFunction(Function &F) {
   if (ChecksumMismatch && LTOPhase == ThinOrFullLTOPhase::ThinLTOPreLink)
     F.addFnAttr("profile-checksum-mismatch");
 
-  // The matching result will be saved to IRToProfileLocationMap, create a
-  // new map for each function.
-  auto &IRToProfileLocationMap = getIRToProfileLocationMap(*FSForMatching);
+  // Match each IR function independently, even when suffix elision or call
+  // graph matching makes several functions use the same profile.
+  LocToLocMap IRToProfileLocationMap;
   runStaleProfileMatching(F, IRAnchors, ProfileAnchors, IRToProfileLocationMap,
                           RunCFGMatching, RunCGMatching);
-  // Find and update callsite match states after matching.
-  if (RunCFGMatching && (ReportProfileStaleness || PersistProfileStaleness))
-    recordCallsiteMatchStates(F, IRAnchors, ProfileAnchors,
-                              &IRToProfileLocationMap);
+
+  if (ProfilesWithConflictingMappings.contains(ProfileName))
+    return;
+
+  auto [It, Inserted] =
+      FuncMappings.try_emplace(ProfileName, std::move(IRToProfileLocationMap));
+  if (!Inserted && It->second != IRToProfileLocationMap) {
+    // A shared FunctionSamples has one map for both outlined and inlined
+    // consumers. Do not let processing order select an incompatible map.
+    LLVM_DEBUG(dbgs() << "Discard conflicting stale profile mappings for "
+                      << ProfileName << "\n");
+    FuncMappings.erase(It);
+    ProfilesWithConflictingMappings.insert(ProfileName);
+  }
+}
+
+void SampleProfileMatcher::collectCallsiteMatchStates(bool IsPostMatch) {
+  LocToLocMap IdentityMapping;
+  for (auto &F : M) {
+    if (skipProfileForFunction(F))
+      continue;
+    const auto *FS = getSamplesForMatching(F);
+    if (!FS)
+      continue;
+
+    AnchorMap IRAnchors;
+    findIRAnchors(F, IRAnchors);
+    AnchorMap ProfileAnchors;
+    findProfileAnchors(*FS, ProfileAnchors);
+    const LocToLocMap *Mapping = nullptr;
+    if (IsPostMatch) {
+      auto It = FuncMappings.find(FS->getFuncName());
+      Mapping = It == FuncMappings.end() ? &IdentityMapping : &It->second;
+    }
+    recordCallsiteMatchStates(FS->getFuncName(), IRAnchors, ProfileAnchors,
+                              Mapping);
+  }
 }
 
 void SampleProfileMatcher::recordCallsiteMatchStates(
-    const Function &F, const AnchorMap &IRAnchors,
+    StringRef ProfileName, const AnchorMap &IRAnchors,
     const AnchorMap &ProfileAnchors,
     const LocToLocMap *IRToProfileLocationMap) {
   bool IsPostMatch = IRToProfileLocationMap != nullptr;
-  auto &CallsiteMatchStates =
-      FuncCallsiteMatchStates[FunctionSamples::getCanonicalFnName(F.getName())];
+  auto &CallsiteMatchStates = FuncCallsiteMatchStates[ProfileName];
 
   auto MapIRLocToProfileLoc = [&](const LineLocation &IRLoc) {
     // IRToProfileLocationMap is null in pre-match phrase.
@@ -559,10 +591,14 @@ void SampleProfileMatcher::recordCallsiteMatchStates(
       auto It = CallsiteMatchStates.find(ProfileLoc);
       if (It == CallsiteMatchStates.end())
         CallsiteMatchStates.try_emplace(ProfileLoc, MatchState::InitialMatch);
-      else if (IsPostMatch) {
-        if (It->second == MatchState::InitialMatch)
+      else if (!IsPostMatch)
+        It->second = MatchState::InitialMatch;
+      else {
+        if (It->second == MatchState::InitialMatch ||
+            It->second == MatchState::RemovedMatch)
           It->second = MatchState::UnchangedMatch;
-        else if (It->second == MatchState::InitialMismatch)
+        else if (It->second == MatchState::InitialMismatch ||
+                 It->second == MatchState::UnchangedMismatch)
           It->second = MatchState::RecoveredMismatch;
       }
     }
@@ -1130,6 +1166,16 @@ void SampleProfileMatcher::runOnModule() {
 
   if (SalvageStaleProfile)
     distributeIRToProfileLocationMap();
+
+  // Finalize shared mappings before measuring recovery. Collect all initial
+  // states before final states so shared profiles aggregate matches
+  // consistently.
+  if (ReportProfileStaleness.getNumOccurrences() > 0 ||
+      PersistProfileStaleness) {
+    collectCallsiteMatchStates(false);
+    if (SalvageStaleProfile)
+      collectCallsiteMatchStates(true);
+  }
 
   computeAndReportProfileStaleness();
 }
